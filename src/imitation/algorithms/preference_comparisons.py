@@ -130,7 +130,7 @@ class AgentTrainer(TrajectoryGenerator):
     def __init__(
         self,
         algorithm: base_class.BaseAlgorithm,
-        reward_fn: Union[reward_function.RewardFn, reward_nets.RewardNet],
+        reward_fn: Union[reward_function.RewardFn, reward_nets.RewardNet, None],
         venv: vec_env.VecEnv,
         rng: np.random.Generator,
         exploration_frac: float = 0.0,
@@ -143,7 +143,7 @@ class AgentTrainer(TrajectoryGenerator):
         Args:
             algorithm: the stable-baselines algorithm to use for training.
             reward_fn: either a RewardFn or a RewardNet instance that will supply
-                the rewards used for training the agent.
+                the rewards used for training the agent. If None, uses ground truth rewards.
             venv: vectorized environment to train in.
             rng: random number generator used for exploration and for sampling.
             exploration_frac: fraction of the trajectories that will be generated
@@ -158,7 +158,7 @@ class AgentTrainer(TrajectoryGenerator):
         # NOTE: this has to come after setting self.algorithm because super().__init__
         # will set self.logger, which also sets the logger for the algorithm
         super().__init__(custom_logger)
-        if isinstance(reward_fn, reward_nets.RewardNet):
+        if reward_fn is not None and isinstance(reward_fn, reward_nets.RewardNet):
             utils.check_for_correct_spaces(
                 venv,
                 reward_fn.observation_space,
@@ -179,12 +179,20 @@ class AgentTrainer(TrajectoryGenerator):
         # SB3 may move the image-channel dimension in the observation space, making
         # `algorithm.get_env()` not match with `reward_fn`.
         self.buffering_wrapper = wrappers.BufferingWrapper(venv)
-        self.venv = self.reward_venv_wrapper = reward_wrapper.RewardVecEnvWrapper(
-            self.buffering_wrapper,
-            reward_fn=self.reward_fn,
-        )
-
-        self.log_callback = self.reward_venv_wrapper.make_log_callback()
+        
+        # Only wrap with RewardVecEnvWrapper if a custom reward function is provided
+        # If reward_fn is None, use ground truth rewards from the environment
+        if self.reward_fn is not None:
+            self.venv = self.reward_venv_wrapper = reward_wrapper.RewardVecEnvWrapper(
+                self.buffering_wrapper,
+                reward_fn=self.reward_fn,
+            )
+            self.log_callback = self.reward_venv_wrapper.make_log_callback()
+        else:
+            # Use ground truth rewards - no reward wrapper needed
+            self.venv = self.buffering_wrapper
+            self.reward_venv_wrapper = None
+            self.log_callback = None
 
         self.algorithm.set_env(self.venv)
         # Unlike with BufferingWrapper, we should use `algorithm.get_env()` instead
@@ -221,12 +229,28 @@ class AgentTrainer(TrajectoryGenerator):
                 f"There are {n_transitions} transitions left in the buffer. "
                 "Call AgentTrainer.sample() first to clear them.",
             )
-        self.algorithm.learn(
-            total_timesteps=steps,
-            reset_num_timesteps=False,
-            callback=self.log_callback,
-            **kwargs,
-        )
+        
+        # Check rl library type to determine learn method parameters
+        if 'rsl_rl' in str(type(self.algorithm)).lower():
+            # RSL-RL's learn method uses 'iterations' instead of 'total_timesteps'
+            # Pass reset_num_timesteps=False to preserve training statistics across calls
+            self.algorithm.learn(iterations=steps, reset_num_timesteps=False)
+        else:
+            # Stable Baselines3 and other libraries use 'total_timesteps'
+            # Only pass callback if using learned reward (callback may be None for ground truth)
+            if self.log_callback is not None:
+                self.algorithm.learn(
+                    total_timesteps=steps,
+                    reset_num_timesteps=False,
+                    callback=self.log_callback,
+                    **kwargs,
+                )
+            else:
+                self.algorithm.learn(
+                    total_timesteps=steps,
+                    reset_num_timesteps=False,
+                    **kwargs,
+                )
 
     def sample(self, steps: int) -> Sequence[types.TrajectoryWithRew]:
         agent_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
@@ -246,7 +270,7 @@ class AgentTrainer(TrajectoryGenerator):
                 f"{self.exploration_frac} > 0 but steps={steps} is too small.",
             )
         agent_steps = steps - exploration_steps
-
+        
         if avail_steps < agent_steps:
             self.logger.log(
                 f"Requested {agent_steps} transitions but only {avail_steps} in buffer."
@@ -313,7 +337,9 @@ class AgentTrainer(TrajectoryGenerator):
     @logger.setter
     def logger(self, value: imit_logger.HierarchicalLogger) -> None:
         self._logger = value
-        self.algorithm.set_logger(self.logger)
+        # Note: for rsl_rl don't set the logger for the algorithm, as it will overwrite the default rsl_rl logger
+        if 'rsl_rl' not in str(type(self.algorithm)).lower():
+            self.algorithm.set_logger(self.logger)
 
 
 def _get_trajectories(
@@ -1687,18 +1713,21 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         )
         reward_loss = None
         reward_accuracy = None
-
+        
         for i, num_pairs in enumerate(schedule):
             ##########################
             # Gather new preferences #
             ##########################
+            # This num_steps is the total number of transitions to sample
             num_steps = math.ceil(
                 self.transition_oversampling * 2 * num_pairs * self.fragment_length,
             )
             self.logger.log(
                 f"Collecting {2 * num_pairs} fragments ({num_steps} transitions)",
             )
+            #
             trajectories = self.trajectory_generator.sample(num_steps)
+
             # This assumes there are no fragments missing initial timesteps
             # (but allows for fragments missing terminal timesteps).
             horizons = (len(traj) for traj in trajectories if traj.terminal)
@@ -1731,7 +1760,13 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             ###################
             # Train the agent #
             ###################
-            num_steps = timesteps_per_iteration
+            # # For Gymnasium and Stablebaselines3
+            # num_steps = timesteps_per_iteration
+            # For IsaacLab and rsl_rl, this is the training step for all environments, which might cause premature 
+            # policy on inaccurate reward.
+            num_steps = int(timesteps_per_iteration / self.trajectory_generator.venv.num_envs)
+            num_steps = np.max([np.min([num_steps, 100]), 100])    # Limit minimum training steps to 1000
+            # import pdb; pdb.set_trace() 
             # if the number of timesteps per iterations doesn't exactly divide
             # the desired total number of timesteps, we train the agent a bit longer
             # at the end of training (where the reward model is presumably best)
