@@ -160,3 +160,4 @@ dmypy.json
 /quickstart/
 
 .vscode/
+docs/tutorials/IsaacLab_PL/outputs/
