@@ -51,11 +51,23 @@ class BufferingWrapper(VecEnvWrapper):
             raise RuntimeError("BufferingWrapper reset() before samples were accessed")
         self._init_reset = True
         self.n_transitions = 0
-        obs = self.venv.reset(**kwargs)
+        
+        # Check environment interface
+        if isinstance(self.venv, VecEnv):
+            # For Gymnasium following Stable-Baselines3 VecEnv interface
+            obs = self.venv.reset(**kwargs)
+        else:
+            # For IsaacLab environments
+            obs, obs_dict = self.venv.reset(**kwargs)
+        
+        # Turn tensors into numpy arrays as Imitation is aligned with Stable Baselines3 interface
+        obs = obs.cpu().numpy() if hasattr(obs, "cpu") else obs
+
         self._traj_accum = rollout.TrajectoryAccumulator()
         obs = types.maybe_wrap_in_dictobs(obs)
         for i, ob in enumerate(obs):
             self._traj_accum.add_step({"obs": ob}, key=i)
+        
         self._timesteps = np.zeros((len(obs),), dtype=int)
         obs = types.maybe_unwrap_dictobs(obs)
         return obs
@@ -71,9 +83,35 @@ class BufferingWrapper(VecEnvWrapper):
         assert self._saved_acts is not None
         acts, self._saved_acts = self._saved_acts, None
         obs, rews, dones, infos = self.venv.step_wait()
-
+        # Turn tensors into numpy arrays as Imitation is aligned with Stable Baselines3 interface
+        acts = acts.cpu().numpy() if hasattr(acts, "cpu") else acts
+        obs = obs.cpu().numpy() if hasattr(obs, "cpu") else obs
+        rews = rews.cpu().numpy() if hasattr(rews, "cpu") else rews
+        dones = dones.cpu().numpy() if hasattr(dones, "cpu") else dones
+        # Convert all tensors in infos to numpy arrays
+        if isinstance(infos, list):
+            # infos is a list of dicts (standard VecEnv format)
+            for i, info_dict in enumerate(infos):
+                if isinstance(info_dict, dict):
+                    for key, value in info_dict.items():
+                        if hasattr(value, "cpu"):
+                            infos[i][key] = value.cpu().numpy()
+        elif isinstance(infos, dict):
+            # infos is a dict of dicts or dict of values
+            for key, value in infos.items():
+                if isinstance(value, dict):
+                    # dict of dicts: convert tensors in nested dicts
+                    for sub_key, sub_value in value.items():
+                        if hasattr(sub_value, "cpu"):
+                            infos[key][sub_key] = sub_value.cpu().numpy()
+                elif hasattr(value, "cpu"):
+                    # dict of tensors: convert tensor directly
+                    infos[key] = value.cpu().numpy()
+        
+        
         self.n_transitions += self.num_envs
         self._timesteps += 1
+        
         ep_lens = self._timesteps[dones]
         if len(ep_lens) > 0:
             self._ep_lens += list(ep_lens)

@@ -62,7 +62,16 @@ class ExplorationWrapper:
         episode_start: Optional[np.ndarray],
     ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         del state, episode_start  # Unused
-        acts = [self.venv.action_space.sample() for _ in range(len(obs))]
+        
+        # Deal with the difference between IsaacLab and Gymnasium VecEnv action spaces
+        if hasattr(self.venv, 'unwrapped') and 'isaaclab' in str(type(self.venv.unwrapped)).lower():
+            # IsaacLab's action_space has the shape [num_envs, action_dim], while its single_action_space has shape [action_dim,].
+            action_space = self.venv.unwrapped.single_action_space
+        else:
+            # Standard VecEnv action space, e.g., Gymnasium
+            action_space = self.venv.action_space
+    
+        acts = [action_space.sample() for _ in range(len(obs))]
         return np.stack(acts, axis=0), None
 
     def _switch(self) -> None:
