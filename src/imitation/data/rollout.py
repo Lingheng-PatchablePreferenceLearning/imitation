@@ -87,8 +87,6 @@ class TrajectoryAccumulator:
             key: key to uniquely identify the trajectory to append to, if working
                 with multiple partial trajectories.
         """
-        if torch.is_tensor(step_dict.get("obs", None)):
-            import pdb; pdb.set_trace()
         self.partial_trajectories[key].append(step_dict)
 
     def finish_trajectory(
@@ -112,19 +110,11 @@ class TrajectoryAccumulator:
         for part_dict in part_dicts:
             for k, array in part_dict.items():
                 out_dict_unstacked[k].append(array)
-        
-        # Check if there are any tensors in out_dict_unstacked
-        for k, arr_list in out_dict_unstacked.items():
-            for idx, item in enumerate(arr_list):
-                if torch.is_tensor(item):
-                    import pdb; pdb.set_trace()
-                    print(f"Found tensor in out_dict_unstacked['{k}'][{idx}]")
-        
+
         out_dict_stacked = {
             k: types.stack_maybe_dictobs(arr_list)
             for k, arr_list in out_dict_unstacked.items()
         }
-        
         traj = types.TrajectoryWithRew(**out_dict_stacked, terminal=terminal)
         assert traj.rews.shape[0] == traj.acts.shape[0] == len(traj.obs) - 1
         return traj
