@@ -92,21 +92,31 @@ class RewardVecEnvWrapper(vec_env.VecEnvWrapper):
     def step_wait(self):
         obs, old_rews, dones, infos = self.venv.step_wait()
 
-        # The vecenvs automatically reset the underlying environments once they
-        # encounter a `done`, in which case the last observation corresponding to
-        # the `done` is dropped. We're going to pull it back out of the info dict!
-        obs_fixed = []
-        obs = types.maybe_wrap_in_dictobs(obs)
-        for single_obs, single_done, single_infos in zip(obs, dones, infos):
-            if single_done:
-                single_obs = single_infos["terminal_observation"]
+        # 
+        if 'isaaclab' not in str(type(self.venv.unwrapped)).lower():
+            # The vecenvs automatically reset the underlying environments once they
+            # encounter a `done`, in which case the last observation corresponding to
+            # the `done` is dropped. We're going to pull it back out of the info dict!
+            obs_fixed = []
+            obs = types.maybe_wrap_in_dictobs(obs)
+            for single_obs, single_done, single_infos in zip(obs, dones, infos):
+                if single_done:
+                    single_obs = single_infos["terminal_observation"]
 
-            obs_fixed.append(types.maybe_wrap_in_dictobs(single_obs))
-        obs_fixed = (
-            types.DictObs.stack(obs_fixed)
-            if isinstance(obs, types.DictObs)
-            else np.stack(obs_fixed)
-        )
+                obs_fixed.append(types.maybe_wrap_in_dictobs(single_obs))
+            obs_fixed = (
+                types.DictObs.stack(obs_fixed)
+                if isinstance(obs, types.DictObs)
+                else np.stack(obs_fixed)
+            )
+        else:
+            # IsaacLab VecEnv case
+            # dones indicate either termination or timeout in IsaacLab, and IsaacLab reset for both cases
+            obs_fixed = obs.copy()
+            if (dones == 1).sum() > 0:
+                obs_fixed[dones==1] = infos['observation_before_reset']['policy'][dones==1]
+        
+        # Compute new rewards using the learned reward function
         rews = self.reward_fn(
             self._old_obs,
             self._actions,
@@ -128,6 +138,11 @@ class RewardVecEnvWrapper(vec_env.VecEnvWrapper):
         # trajectory, not the last observation of the old trajectory
         obs = types.maybe_unwrap_dictobs(obs)
         self._old_obs = obs
-        for info_dict, old_rew in zip(infos, old_rews):
-            info_dict["original_env_rew"] = old_rew
+        # 
+        if 'isaaclab' not in str(type(self.venv.unwrapped)).lower():
+            for info_dict, old_rew in zip(infos, old_rews):
+                info_dict["original_env_rew"] = old_rew
+        else:
+            infos["original_env_rew"] = old_rews
+        
         return obs, rews, dones, infos
