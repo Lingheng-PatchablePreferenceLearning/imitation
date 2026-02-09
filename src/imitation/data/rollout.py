@@ -26,6 +26,8 @@ from stable_baselines3.common.vec_env import VecEnv
 
 from imitation.data import types
 
+from rsl_rl.runners.runner import Runner
+import torch
 
 def unwrap_traj(traj: types.TrajectoryWithRew) -> types.TrajectoryWithRew:
     """Uses `RolloutInfoWrapper`-captured `obs` and `rews` to replace fields.
@@ -85,6 +87,8 @@ class TrajectoryAccumulator:
             key: key to uniquely identify the trajectory to append to, if working
                 with multiple partial trajectories.
         """
+        if torch.is_tensor(step_dict.get("obs", None)):
+            import pdb; pdb.set_trace()
         self.partial_trajectories[key].append(step_dict)
 
     def finish_trajectory(
@@ -108,11 +112,19 @@ class TrajectoryAccumulator:
         for part_dict in part_dicts:
             for k, array in part_dict.items():
                 out_dict_unstacked[k].append(array)
-
+        
+        # Check if there are any tensors in out_dict_unstacked
+        for k, arr_list in out_dict_unstacked.items():
+            for idx, item in enumerate(arr_list):
+                if torch.is_tensor(item):
+                    import pdb; pdb.set_trace()
+                    print(f"Found tensor in out_dict_unstacked['{k}'][{idx}]")
+        
         out_dict_stacked = {
             k: types.stack_maybe_dictobs(arr_list)
             for k, arr_list in out_dict_unstacked.items()
         }
+        
         traj = types.TrajectoryWithRew(**out_dict_stacked, terminal=terminal)
         assert traj.rews.shape[0] == traj.acts.shape[0] == len(traj.obs) - 1
         return traj
@@ -154,7 +166,8 @@ class TrajectoryAccumulator:
                 "Need to first initialize partial trajectory using "
                 "self._traj_accum.add_step({'obs': ob}, key=env_idx)"
             )
-
+        # For Gymnasium environments, infos is a list of dicts, each corresponding to an env in the VecEnv. 
+        # However, for IsaacLab environments, infos is a dict of arrays. So we need to handle both cases here.
         # iterate through steps
         zip_iter = enumerate(zip(acts, wrapped_obs, rews, dones, infos))
         for env_idx, (act, ob, rew, done, info) in zip_iter:
@@ -162,10 +175,18 @@ class TrajectoryAccumulator:
                 # When dones[i] from VecEnv.step() is True, obs[i] is the first
                 # observation following reset() of the ith VecEnv, and
                 # infos[i]["terminal_observation"] is the actual final observation.
-                real_ob = types.maybe_wrap_in_dictobs(info["terminal_observation"])
+                
+                # Simply differentiate whether infos is a list or a dict to decide how to get terminal_observation.
+                if isinstance(infos, list): 
+                    # Gymnasium case
+                    real_ob = types.maybe_wrap_in_dictobs(info["terminal_observation"])
+                else:
+                    # IsaacLab case
+                    # I named it to observation_before_reset in IsaacLab manager_based_rl_env.py
+                    real_ob = types.maybe_wrap_in_dictobs(infos['observation_before_reset']['policy'][env_idx])
             else:
                 real_ob = ob
-
+            
             self.add_step(
                 dict(
                     acts=act,
@@ -292,6 +313,7 @@ def policy_to_callable(
 ) -> PolicyCallable:
     """Converts any policy-like object into a function from observations to actions."""
     get_actions: PolicyCallable
+    
     if policy is None:
 
         def get_actions(
@@ -323,7 +345,18 @@ def policy_to_callable(
                 deterministic=deterministic_policy,
             )
             return acts, states
-
+    elif isinstance(policy, Runner):
+        def get_actions(
+            observations: Union[np.ndarray, Dict[str, np.ndarray]],
+            states: Optional[Tuple[np.ndarray, ...]],
+            episode_starts: Optional[np.ndarray],
+        ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+            # draw_actions will call _process_observations() in hri-ppl/rsl_rl/rsl_rl/algorithms/actor_critic.py
+            #  which separately deal with critic observation and critic observation. We need to pass critic observation here.
+            # Note: RSL-RL Runner only support torch tensor input for observations.
+            acts, acts_data = policy.agent.draw_actions(torch.tensor(observations), 
+                                                        env_info={"observations": {"critic": torch.tensor(observations)}})
+            return acts, states
     elif callable(policy):
         # When a policy callable is passed, by default we will use it directly.
         # We are not able to change the determinism of the policy when it is a
@@ -415,13 +448,28 @@ def generate_trajectories(
     trajectories = []
     # accumulator for incomplete trajectories
     trajectories_accum = TrajectoryAccumulator()
+    # # venv will be wrapped by wrappers.BufferingWrapper(venv) and reward_wrapper.RewardVecEnvWrapper()
+    # #  in hri-ppl/imitation/src/imitation/algorithms/preference_comparisons.py, so checked unwrapped type here to decide how to 
+    # #  defferentiate wheather it is Gymnasium or IsaacLab environment.
+    # if isinstance(venv.unwrapped, VecEnv):
+    #     obs = venv.reset()
+    # else:
+    #     # Import IsaacLab related module after IsaacSim is initialized. Otherwise, it will show "No module named 'isaacsim.core'".
+    #     from isaaclab.envs import ManagerBasedRLEnv
+    #     import pdb; pdb.set_trace()
+    #     if isinstance(venv.unwrapped, ManagerBasedRLEnv):
+    #         obs, _ = venv.reset()
+    #     else:
+    #         raise ValueError(f"Unsupported venv type: {type(venv)}")
+    # wrappers.BufferingWrapper(venv) will only return obs in reset(), so no need to change anything.
     obs = venv.reset()
+    
     assert isinstance(
         obs,
         (np.ndarray, dict),
     ), "Tuple observations are not supported."
     wrapped_obs = types.maybe_wrap_in_dictobs(obs)
-
+    
     # we use dictobs to iterate over the envs in a vecenv
     for env_idx, ob in enumerate(wrapped_obs):
         # Seed with first obs only. Inside loop, we'll only add second obs from
@@ -441,10 +489,53 @@ def generate_trajectories(
     active = np.ones(venv.num_envs, dtype=bool)
     state = None
     dones = np.zeros(venv.num_envs, dtype=bool)
+    
+    # Check if we're using IsaacLab environment
+    is_isaaclab_env = hasattr(venv, 'unwrapped') and 'isaaclab' in str(type(venv.unwrapped)).lower()
+    if is_isaaclab_env:
+        # Get the device from the environment
+        device = venv.unwrapped.device
+    
     while np.any(active):
         # policy gets unwrapped observations (eg as dict, not dictobs)
         acts, state = get_actions(obs, state, dones)
+        
+        # For IsaacLab environments, convert actions to torch tensors on proper device.
+        #   Many different places will call action generation:
+        #       e.g., hri-ppl/imitation/src/imitation/policies/exploration_wrapper.py
+        if is_isaaclab_env and not torch.is_tensor(acts):
+            acts = torch.from_numpy(acts).to(device)
+
         obs, rews, dones, infos = venv.step(acts)
+
+        # Turn tensors into numpy arrays as Imitation is aligned with Stable Baselines3 interface
+        acts = acts.cpu().numpy() if hasattr(acts, "cpu") else acts
+        obs = obs.cpu().numpy() if hasattr(obs, "cpu") else obs
+        rews = rews.cpu().numpy() if hasattr(rews, "cpu") else rews
+        if hasattr(dones, "cpu"):
+            dones = dones.cpu().numpy().astype(bool)
+        else:
+            dones = dones.astype(bool) if hasattr(dones, "astype") else dones
+        # Convert all tensors in infos to numpy arrays
+        if isinstance(infos, list):
+            # infos is a list of dicts (standard VecEnv format)
+            for i, info_dict in enumerate(infos):
+                if isinstance(info_dict, dict):
+                    for key, value in info_dict.items():
+                        if hasattr(value, "cpu"):
+                            infos[i][key] = value.cpu().numpy()
+        elif isinstance(infos, dict):
+            # infos is a dict of dicts or dict of values
+            for key, value in infos.items():
+                if isinstance(value, dict):
+                    # dict of dicts: convert tensors in nested dicts
+                    for sub_key, sub_value in value.items():
+                        if hasattr(sub_value, "cpu"):
+                            infos[key][sub_key] = sub_value.cpu().numpy()
+                elif hasattr(value, "cpu"):
+                    # dict of tensors: convert tensor directly
+                    infos[key] = value.cpu().numpy()
+
         assert isinstance(
             obs,
             (np.ndarray, dict),
@@ -471,6 +562,10 @@ def generate_trajectories(
             # environments where a trajectory was completed this timestep.
             active &= ~dones
 
+    # Calculate total steps collected
+    total_steps = sum(len(t.acts) for t in trajectories)
+    print(f"Collected {len(trajectories)} trajectories, {total_steps} steps.")
+
     # Note that we just drop partial trajectories. This is not ideal for some
     # algos; e.g. BC can probably benefit from partial trajectories, too.
 
@@ -483,21 +578,34 @@ def generate_trajectories(
     # Sanity checks.
     for trajectory in trajectories:
         n_steps = len(trajectory.acts)
+        # Check observation shape
         # extra 1 for the end
-        if isinstance(venv.observation_space, spaces.Dict):
+        # Note that IsaacLab envs's observation_space includes env_num while Stable-Baselines3's VecEnv
+        #  observation_space does not include env_num. So for IsaacLab envs, we need to use 
+        # venv.single_observation_space.
+        if hasattr(venv, 'unwrapped') and 'isaaclab' in str(type(venv.unwrapped)).lower():
+            # We don't consider dict observation space for now. If needed, we can extend it later.
+            obs_space = venv.unwrapped.single_observation_space['policy']
+            act_space = venv.unwrapped.single_action_space
+        else:
+            obs_space = venv.observation_space
+            act_space = venv.action_space
+        if isinstance(obs_space, spaces.Dict):
             exp_obs = {}
-            for k, v in venv.observation_space.items():
+            for k, v in obs_space.items():
                 assert v.shape is not None
                 exp_obs[k] = (n_steps + 1,) + v.shape
         else:
-            obs_space_shape = venv.observation_space.shape
+            obs_space_shape = obs_space.shape
             assert obs_space_shape is not None
             exp_obs = (n_steps + 1,) + obs_space_shape  # type: ignore[assignment]
         real_obs = trajectory.obs.shape
         assert real_obs == exp_obs, f"expected shape {exp_obs}, got {real_obs}"
-        assert venv.action_space.shape is not None
-        exp_act = (n_steps,) + venv.action_space.shape
+        # Check action shape
+        assert act_space.shape is not None
+        exp_act = (n_steps,) + act_space.shape
         real_act = trajectory.acts.shape
+        # Check reward shape
         assert real_act == exp_act, f"expected shape {exp_act}, got {real_act}"
         exp_rew = (n_steps,)
         real_rew = trajectory.rews.shape
